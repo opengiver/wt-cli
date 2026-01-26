@@ -1,0 +1,491 @@
+#!/bin/bash
+# wt - Worktree Management CLI
+# Usage: wt <command> [args]
+#
+# Commands:
+#   ls, list          List all worktrees and their status
+#   cd <name>         Print cd command to worktree (use: cd $(wt cd <name>))
+#   dev [name]        Start dev server in tmux (current or specified worktree)
+#   dev-all           Start all worktrees in tmux session
+#   stop [name|all]   Stop dev server(s)
+#   attach            Attach to tmux session
+#   ports             Show port assignments
+#   open [name]       Open in browser (localhost:PORT)
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Find project root and worktrees directory
+find_project_root() {
+  local dir="$PWD"
+  
+  # If we're in a worktree, find the main repo
+  if [[ -f "$dir/.git" ]]; then
+    # This is a worktree, .git is a file pointing to main repo
+    dir=$(cat "$dir/.git" | sed 's/gitdir: //' | sed 's/\.git\/worktrees\/.*//')
+  elif [[ -d "$dir/.git" ]]; then
+    # This is the main repo
+    dir="$dir"
+  else
+    # Try to find git root
+    dir=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+  fi
+  
+  echo "$dir"
+}
+
+PROJECT_ROOT=$(find_project_root)
+if [[ -z "$PROJECT_ROOT" ]]; then
+  echo -e "${RED}Error: Not in a git repository${NC}"
+  exit 1
+fi
+
+PROJECT_NAME=$(basename "$PROJECT_ROOT")
+WORKTREES_DIR="$(dirname "$PROJECT_ROOT")/${PROJECT_NAME}-worktrees"
+TMUX_SESSION="${PROJECT_NAME}-dev"
+BASE_PORT=3000
+
+# Detect project type (checks root and common subdirectories)
+detect_project_type() {
+  local dir="${1:-$PWD}"
+  
+  # Check root first, then common subdirectories
+  local check_dirs=("$dir" "$dir/app" "$dir/src" "$dir/client" "$dir/frontend" "$dir/mobile")
+  
+  for check_dir in "${check_dirs[@]}"; do
+    if [[ -f "$check_dir/pubspec.yaml" ]]; then
+      echo "flutter"
+      return
+    fi
+  done
+  
+  for check_dir in "${check_dirs[@]}"; do
+    if [[ -f "$check_dir/package.json" ]]; then
+      echo "nodejs"
+      return
+    fi
+  done
+  
+  if [[ -f "$dir/go.mod" ]]; then
+    echo "go"
+  elif [[ -f "$dir/Cargo.toml" ]]; then
+    echo "rust"
+  elif [[ -f "$dir/requirements.txt" ]] || [[ -f "$dir/pyproject.toml" ]]; then
+    echo "python"
+  else
+    echo "generic"
+  fi
+}
+
+# Find Flutter app directory (returns subdirectory if pubspec.yaml is not in root)
+find_flutter_dir() {
+  local dir="${1:-$PWD}"
+  local check_dirs=("$dir" "$dir/app" "$dir/src" "$dir/client" "$dir/frontend" "$dir/mobile")
+  
+  for check_dir in "${check_dirs[@]}"; do
+    if [[ -f "$check_dir/pubspec.yaml" ]]; then
+      echo "$check_dir"
+      return
+    fi
+  done
+  
+  echo ""
+}
+
+# Get dev command for project type
+get_dev_command() {
+  local dir="${1:-$PWD}"
+  local port="${2:-3000}"
+  local project_type=$(detect_project_type "$dir")
+  
+  case $project_type in
+    flutter)
+      local flutter_dir=$(find_flutter_dir "$dir")
+      if [[ "$flutter_dir" != "$dir" ]] && [[ -n "$flutter_dir" ]]; then
+        echo "cd '$flutter_dir' && flutter run --web-port=$port"
+      else
+        echo "flutter run --web-port=$port"
+      fi
+      ;;
+    nodejs)
+      # Find package.json location
+      local pkg_dir="$dir"
+      local check_dirs=("$dir" "$dir/app" "$dir/src" "$dir/client" "$dir/frontend")
+      for check_dir in "${check_dirs[@]}"; do
+        if [[ -f "$check_dir/package.json" ]]; then
+          pkg_dir="$check_dir"
+          break
+        fi
+      done
+      
+      if [[ -f "$pkg_dir/package.json" ]]; then
+        local cd_prefix=""
+        if [[ "$pkg_dir" != "$dir" ]]; then
+          cd_prefix="cd '$pkg_dir' && "
+        fi
+        
+        # Check if it's Next.js, Vite, or generic
+        if grep -q '"next"' "$pkg_dir/package.json" 2>/dev/null; then
+          echo "${cd_prefix}PORT=$port npm run dev"
+        elif grep -q '"vite"' "$pkg_dir/package.json" 2>/dev/null; then
+          echo "${cd_prefix}npm run dev -- --port $port"
+        else
+          echo "${cd_prefix}PORT=$port npm run dev"
+        fi
+      fi
+      ;;
+    go)
+      echo "go run . --port $port"
+      ;;
+    python)
+      echo "python -m flask run --port $port"
+      ;;
+    *)
+      echo "echo 'Unknown project type'"
+      ;;
+  esac
+}
+
+# Get port for worktree (based on index)
+get_worktree_port() {
+  local wt_name="$1"
+  local index=0
+  
+  for wt in "$WORKTREES_DIR"/*/; do
+    if [[ -d "$wt" ]]; then
+      local name=$(basename "$wt")
+      if [[ "$name" == "$wt_name" ]]; then
+        echo $((BASE_PORT + index))
+        return
+      fi
+      ((index++))
+    fi
+  done
+  
+  # Default if not found
+  echo $BASE_PORT
+}
+
+# Check if port is in use
+is_port_in_use() {
+  local port="$1"
+  lsof -i ":$port" &>/dev/null
+}
+
+# List all worktrees
+cmd_list() {
+  echo -e "${CYAN}📁 Worktrees for ${PROJECT_NAME}${NC}"
+  echo "========================================"
+  echo ""
+  
+  # Main project
+  local main_type=$(detect_project_type "$PROJECT_ROOT")
+  echo -e "  ${BLUE}[main]${NC} $PROJECT_ROOT"
+  echo -e "    Type: $main_type"
+  echo -e "    Branch: $(cd "$PROJECT_ROOT" && git branch --show-current)"
+  echo ""
+  
+  if [[ ! -d "$WORKTREES_DIR" ]]; then
+    echo -e "  ${YELLOW}No worktrees found${NC}"
+    echo -e "  Create with: git worktree add ../\${PROJECT}-worktrees/<name> <branch>"
+    return
+  fi
+  
+  local index=0
+  for wt in "$WORKTREES_DIR"/*/; do
+    if [[ -d "$wt" ]]; then
+      local name=$(basename "$wt")
+      local branch=$(cd "$wt" && git branch --show-current 2>/dev/null || echo "unknown")
+      local port=$((BASE_PORT + index))
+      local project_type=$(detect_project_type "$wt")
+      
+      # Check if dev server is running
+      if is_port_in_use "$port"; then
+        local status="${GREEN}● Running${NC} on :$port"
+      else
+        local status="${YELLOW}○ Stopped${NC} (port $port)"
+      fi
+      
+      echo -e "  ${BLUE}[$name]${NC}"
+      echo -e "    Path: $wt"
+      echo -e "    Branch: $branch"
+      echo -e "    Type: $project_type"
+      echo -e "    Status: $status"
+      echo ""
+      
+      ((index++))
+    fi
+  done
+  
+  # tmux session status
+  echo "----------------------------------------"
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo -e "  tmux: ${GREEN}Session '$TMUX_SESSION' active${NC}"
+    echo -e "  Attach: ${CYAN}wt attach${NC}"
+  else
+    echo -e "  tmux: ${YELLOW}No active session${NC}"
+    echo -e "  Start: ${CYAN}wt dev-all${NC}"
+  fi
+}
+
+# Print path to worktree (for cd command)
+cmd_cd() {
+  local name="$1"
+  
+  if [[ -z "$name" ]]; then
+    echo -e "${RED}Usage: cd \$(wt cd <name>)${NC}" >&2
+    exit 1
+  fi
+  
+  local target="$WORKTREES_DIR/$name"
+  if [[ -d "$target" ]]; then
+    echo "$target"
+  else
+    echo -e "${RED}Worktree not found: $name${NC}" >&2
+    echo -e "Available: $(ls "$WORKTREES_DIR" 2>/dev/null | tr '\n' ' ')" >&2
+    exit 1
+  fi
+}
+
+# Start dev server in tmux
+cmd_dev() {
+  local name="$1"
+  local target_dir
+  local port
+  
+  if [[ -z "$name" ]]; then
+    # Use current directory
+    target_dir="$PWD"
+    # Find port based on current worktree
+    local current_name=$(basename "$PWD")
+    port=$(get_worktree_port "$current_name")
+  else
+    target_dir="$WORKTREES_DIR/$name"
+    port=$(get_worktree_port "$name")
+  fi
+  
+  if [[ ! -d "$target_dir" ]]; then
+    echo -e "${RED}Directory not found: $target_dir${NC}"
+    exit 1
+  fi
+  
+  local dev_cmd=$(get_dev_command "$target_dir" "$port")
+  local window_name="${name:-$(basename "$target_dir")}"
+  
+  # Create or use existing tmux session
+  if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$TMUX_SESSION" -n "$window_name" -c "$target_dir"
+    tmux send-keys -t "$TMUX_SESSION:$window_name" "$dev_cmd" C-m
+  else
+    # Check if window exists
+    if tmux list-windows -t "$TMUX_SESSION" | grep -q "$window_name"; then
+      echo -e "${YELLOW}Window '$window_name' already exists${NC}"
+    else
+      tmux new-window -t "$TMUX_SESSION" -n "$window_name" -c "$target_dir"
+      tmux send-keys -t "$TMUX_SESSION:$window_name" "$dev_cmd" C-m
+    fi
+  fi
+  
+  echo -e "${GREEN}✅ Started${NC} $window_name on port $port"
+  echo -e "   ${CYAN}wt attach${NC} to view"
+  echo -e "   ${CYAN}open http://localhost:$port${NC}"
+}
+
+# Start all worktrees in tmux
+cmd_dev_all() {
+  echo -e "${CYAN}🚀 Starting all worktrees...${NC}"
+  
+  # Kill existing session if exists
+  tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+  
+  local first=true
+  local index=0
+  
+  for wt in "$WORKTREES_DIR"/*/; do
+    if [[ -d "$wt" ]]; then
+      local name=$(basename "$wt")
+      local port=$((BASE_PORT + index))
+      local dev_cmd=$(get_dev_command "$wt" "$port")
+      
+      if $first; then
+        tmux new-session -d -s "$TMUX_SESSION" -n "$name" -c "$wt"
+        first=false
+      else
+        tmux new-window -t "$TMUX_SESSION" -n "$name" -c "$wt"
+      fi
+      
+      tmux send-keys -t "$TMUX_SESSION:$name" "$dev_cmd" C-m
+      echo -e "  ${GREEN}✅${NC} $name → localhost:$port"
+      
+      ((index++))
+    fi
+  done
+  
+  if $first; then
+    echo -e "${YELLOW}No worktrees found${NC}"
+    return
+  fi
+  
+  echo ""
+  echo -e "${GREEN}All dev servers started!${NC}"
+  echo ""
+  echo -e "Commands:"
+  echo -e "  ${CYAN}wt attach${NC}        - Attach to tmux session"
+  echo -e "  ${CYAN}Ctrl+b, n${NC}        - Next window (next worktree)"
+  echo -e "  ${CYAN}Ctrl+b, p${NC}        - Previous window"
+  echo -e "  ${CYAN}Ctrl+b, 0-9${NC}      - Jump to window number"
+  echo -e "  ${CYAN}Ctrl+b, w${NC}        - List all windows"
+  echo -e "  ${CYAN}Ctrl+b, d${NC}        - Detach (servers keep running)"
+}
+
+# Stop dev server(s)
+cmd_stop() {
+  local name="$1"
+  
+  if [[ "$name" == "all" ]] || [[ -z "$name" ]]; then
+    echo -e "${CYAN}Stopping all dev servers...${NC}"
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    echo -e "${GREEN}✅ All stopped${NC}"
+  else
+    local port=$(get_worktree_port "$name")
+    local pid=$(lsof -ti ":$port" 2>/dev/null)
+    
+    if [[ -n "$pid" ]]; then
+      kill -9 $pid 2>/dev/null
+      echo -e "${GREEN}✅ Stopped${NC} $name (port $port)"
+    else
+      echo -e "${YELLOW}No server running on port $port${NC}"
+    fi
+    
+    # Also kill tmux window if exists
+    tmux kill-window -t "$TMUX_SESSION:$name" 2>/dev/null || true
+  fi
+}
+
+# Attach to tmux session
+cmd_attach() {
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    tmux attach -t "$TMUX_SESSION"
+  else
+    echo -e "${YELLOW}No active session. Start with:${NC} wt dev-all"
+  fi
+}
+
+# Show port assignments
+cmd_ports() {
+  echo -e "${CYAN}📡 Port Assignments${NC}"
+  echo "===================="
+  
+  local index=0
+  for wt in "$WORKTREES_DIR"/*/; do
+    if [[ -d "$wt" ]]; then
+      local name=$(basename "$wt")
+      local port=$((BASE_PORT + index))
+      local status=""
+      
+      if is_port_in_use "$port"; then
+        status="${GREEN}●${NC}"
+      else
+        status="${YELLOW}○${NC}"
+      fi
+      
+      echo -e "  $status localhost:$port → $name"
+      ((index++))
+    fi
+  done
+}
+
+# Open in browser
+cmd_open() {
+  local name="$1"
+  local port
+  
+  if [[ -z "$name" ]]; then
+    # Current directory
+    local current_name=$(basename "$PWD")
+    port=$(get_worktree_port "$current_name")
+  else
+    port=$(get_worktree_port "$name")
+  fi
+  
+  local url="http://localhost:$port"
+  echo -e "${CYAN}Opening $url${NC}"
+  open "$url" 2>/dev/null || xdg-open "$url" 2>/dev/null || echo "Open manually: $url"
+}
+
+# Show help
+cmd_help() {
+  echo -e "${CYAN}wt - Worktree Management CLI${NC}"
+  echo ""
+  echo "Usage: wt <command> [args]"
+  echo ""
+  echo "Commands:"
+  echo "  ls, list          List all worktrees and their status"
+  echo "  cd <name>         Print path to worktree"
+  echo "                    Usage: cd \$(wt cd <name>)"
+  echo "  dev [name]        Start dev server in tmux"
+  echo "  dev-all           Start all worktrees in tmux session"
+  echo "  stop [name|all]   Stop dev server(s)"
+  echo "  attach            Attach to tmux session"
+  echo "  ports             Show port assignments"
+  echo "  open [name]       Open in browser"
+  echo ""
+  echo "tmux Shortcuts (after 'wt attach'):"
+  echo "  Ctrl+b, n         Next window (next worktree)"
+  echo "  Ctrl+b, p         Previous window"
+  echo "  Ctrl+b, 0-9       Jump to window number"
+  echo "  Ctrl+b, w         List all windows"
+  echo "  Ctrl+b, d         Detach (servers keep running)"
+  echo ""
+  echo "Examples:"
+  echo "  wt ls                    # Show all worktrees"
+  echo "  wt dev-all               # Start all dev servers"
+  echo "  wt attach                # View in tmux"
+  echo "  cd \$(wt cd feature-auth) # Change to worktree"
+  echo "  wt open feature-auth     # Open in browser"
+  echo "  wt stop all              # Stop all servers"
+}
+
+# Main command router
+case "${1:-help}" in
+  ls|list)
+    cmd_list
+    ;;
+  cd)
+    cmd_cd "$2"
+    ;;
+  dev)
+    cmd_dev "$2"
+    ;;
+  dev-all)
+    cmd_dev_all
+    ;;
+  stop)
+    cmd_stop "$2"
+    ;;
+  attach)
+    cmd_attach
+    ;;
+  ports)
+    cmd_ports
+    ;;
+  open)
+    cmd_open "$2"
+    ;;
+  help|--help|-h)
+    cmd_help
+    ;;
+  *)
+    echo -e "${RED}Unknown command: $1${NC}"
+    echo ""
+    cmd_help
+    exit 1
+    ;;
+esac

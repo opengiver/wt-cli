@@ -1,0 +1,234 @@
+#!/bin/bash
+# wtf - Worktree Flutter Switcher
+# Interactive Flutter debugging with easy worktree switching
+#
+# Usage: wtf [device-id]
+#
+# Inside wtf session:
+#   1-9: Switch to worktree
+#   r: Hot reload
+#   R: Hot restart  
+#   q: Quit flutter (then pick new worktree or exit)
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Find project root
+find_project_root() {
+  local dir="$PWD"
+  if [[ -f "$dir/.git" ]]; then
+    dir=$(cat "$dir/.git" | sed 's/gitdir: //' | sed 's/\.git\/worktrees\/.*//')
+  elif [[ -d "$dir/.git" ]]; then
+    dir="$dir"
+  else
+    dir=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+  fi
+  echo "$dir"
+}
+
+PROJECT_ROOT=$(find_project_root)
+if [[ -z "$PROJECT_ROOT" ]]; then
+  echo -e "${RED}Error: Not in a git repository${NC}"
+  exit 1
+fi
+
+PROJECT_NAME=$(basename "$PROJECT_ROOT")
+WORKTREES_DIR="$(dirname "$PROJECT_ROOT")/${PROJECT_NAME}-worktrees"
+DEVICE="${1:-}"
+
+# Get list of worktrees as array
+declare -a WT_NAMES
+declare -a WT_PATHS
+
+# Find Flutter app directory (checks root and common subdirectories)
+find_flutter_dir() {
+  local dir="${1:-$PWD}"
+  local check_dirs=("$dir" "$dir/app" "$dir/src" "$dir/client" "$dir/frontend" "$dir/mobile")
+  
+  for check_dir in "${check_dirs[@]}"; do
+    if [[ -f "$check_dir/pubspec.yaml" ]]; then
+      echo "$check_dir"
+      return
+    fi
+  done
+  
+  echo ""
+}
+
+load_worktrees() {
+  WT_NAMES=()
+  WT_PATHS=()
+  
+  # Add main project if it's a Flutter project (check subdirectories too)
+  local main_flutter_dir=$(find_flutter_dir "$PROJECT_ROOT")
+  if [[ -n "$main_flutter_dir" ]]; then
+    WT_NAMES+=("main")
+    WT_PATHS+=("$main_flutter_dir")
+  fi
+  
+  # Add worktrees
+  if [[ -d "$WORKTREES_DIR" ]]; then
+    for wt in "$WORKTREES_DIR"/*/; do
+      if [[ -d "$wt" ]]; then
+        local wt_flutter_dir=$(find_flutter_dir "${wt%/}")
+        if [[ -n "$wt_flutter_dir" ]]; then
+          local name=$(basename "$wt")
+          WT_NAMES+=("$name")
+          WT_PATHS+=("$wt_flutter_dir")
+        fi
+      fi
+    done
+  fi
+}
+
+# Print banner
+print_banner() {
+  local current="$1"
+  echo ""
+  echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${MAGENTA}║${NC}  ${BOLD}🦋 Flutter Worktree Switcher${NC}  ${DIM}($PROJECT_NAME)${NC}          ${MAGENTA}║${NC}"
+  echo -e "${MAGENTA}╠══════════════════════════════════════════════════════════╣${NC}"
+  if [[ -n "$current" ]]; then
+    printf "${MAGENTA}║${NC}  ${GREEN}▶ Active:${NC} ${BOLD}%-43s${NC}${MAGENTA}║${NC}\n" "$current"
+    if [[ -n "$DEVICE" ]]; then
+      printf "${MAGENTA}║${NC}  ${BLUE}📱 Device:${NC} %-43s${MAGENTA}║${NC}\n" "$DEVICE"
+    fi
+  fi
+  echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+}
+
+# Print menu
+print_menu() {
+  local current="$1"
+  
+  echo -e "${BOLD}  Select worktree to debug:${NC}"
+  echo ""
+  
+  for i in "${!WT_NAMES[@]}"; do
+    local name="${WT_NAMES[$i]}"
+    local path="${WT_PATHS[$i]}"
+    local branch=$(cd "$path" && git branch --show-current 2>/dev/null || echo "unknown")
+    local num=$((i + 1))
+    
+    if [[ "$name" == "$current" ]]; then
+      echo -e "  ${GREEN}▶ [$num] $name${NC} ${DIM}← running${NC}"
+      echo -e "       ${CYAN}$branch${NC}"
+    else
+      echo -e "    ${BOLD}[$num]${NC} $name"
+      echo -e "       ${DIM}$branch${NC}"
+    fi
+  done
+  
+  echo ""
+  echo -e "  ${DIM}────────────────────────────────────────────────────${NC}"
+  echo -e "  ${BOLD}[1-${#WT_NAMES[@]}]${NC} Select   ${BOLD}[q]${NC} Quit"
+  echo ""
+}
+
+# Run flutter for selected worktree
+run_flutter() {
+  local wt_name="$1"
+  local wt_path="$2"
+  
+  clear
+  print_banner "$wt_name"
+  
+  local branch=$(cd "$wt_path" && git branch --show-current 2>/dev/null || echo "unknown")
+  echo -e "${YELLOW}📂 Path:${NC} $wt_path"
+  echo -e "${YELLOW}🌿 Branch:${NC} $branch"
+  echo ""
+  echo -e "${DIM}──────────────────────────────────────────────────────────${NC}"
+  echo -e "${GREEN}🚀 Starting Flutter...${NC}"
+  echo -e "${DIM}   Press 'q' in Flutter to return to worktree selection${NC}"
+  echo -e "${DIM}──────────────────────────────────────────────────────────${NC}"
+  echo ""
+  
+  cd "$wt_path"
+  
+  # Build flutter command
+  local flutter_cmd="flutter run"
+  if [[ -n "$DEVICE" ]]; then
+    flutter_cmd="$flutter_cmd -d \"$DEVICE\""
+  fi
+  
+  # Run flutter (user can interact with it directly)
+  eval $flutter_cmd
+  
+  # Flutter exited (user pressed 'q')
+  return 0
+}
+
+# Main loop
+main() {
+  load_worktrees
+  
+  if [[ ${#WT_NAMES[@]} -eq 0 ]]; then
+    echo -e "${RED}❌ No Flutter worktrees found${NC}"
+    echo -e "${DIM}   Make sure pubspec.yaml exists in your worktrees${NC}"
+    exit 1
+  fi
+  
+  # Auto-detect device if not specified
+  if [[ -z "$DEVICE" ]]; then
+    echo -e "${YELLOW}🔍 Detecting devices...${NC}"
+    # Try to get first available device
+    DEVICE=$(flutter devices 2>/dev/null | grep -E "•|•" | head -1 | awk -F'•' '{print $2}' | xargs)
+    if [[ -z "$DEVICE" ]]; then
+      echo -e "${YELLOW}⚠️  No device specified, Flutter will auto-select${NC}"
+    else
+      echo -e "${GREEN}📱 Using device: $DEVICE${NC}"
+    fi
+  fi
+  
+  local current_idx=0
+  
+  # Check if we're already in a worktree
+  for i in "${!WT_PATHS[@]}"; do
+    if [[ "$PWD" == "${WT_PATHS[$i]}"* ]]; then
+      current_idx=$i
+      break
+    fi
+  done
+  
+  # Main selection loop
+  while true; do
+    clear
+    print_banner "${WT_NAMES[$current_idx]}"
+    print_menu "${WT_NAMES[$current_idx]}"
+    
+    echo -ne "  ${BOLD}Select [1-${#WT_NAMES[@]}] or Enter to run current:${NC} "
+    read -rsn1 key
+    echo ""
+    
+    case "$key" in
+      [1-9])
+        local idx=$((key - 1))
+        if [[ $idx -lt ${#WT_NAMES[@]} ]]; then
+          current_idx=$idx
+          run_flutter "${WT_NAMES[$idx]}" "${WT_PATHS[$idx]}"
+        fi
+        ;;
+      ""|$'\n')
+        # Enter pressed - run current
+        run_flutter "${WT_NAMES[$current_idx]}" "${WT_PATHS[$current_idx]}"
+        ;;
+      q|Q)
+        echo -e "\n${YELLOW}👋 Goodbye!${NC}"
+        exit 0
+        ;;
+    esac
+  done
+}
+
+main

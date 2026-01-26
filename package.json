@@ -1,0 +1,37 @@
+{
+  "name": "wt-cli",
+  "version": "1.0.0",
+  "description": "Git worktree management CLI for parallel development",
+  "bin": {
+    "wt": "./bin/wt",
+    "wtf": "./bin/wtf"
+  },
+  "scripts": {
+    "postinstall": "chmod +x ./bin/wt ./bin/wtf 2>/dev/null || true"
+  },
+  "keywords": [
+    "git",
+    "worktree",
+    "cli",
+    "flutter",
+    "development",
+    "parallel"
+  ],
+  "author": "lbo728",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lbo728/wt-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lbo728/wt-cli/issues"
+  },
+  "homepage": "https://github.com/lbo728/wt-cli#readme",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}
