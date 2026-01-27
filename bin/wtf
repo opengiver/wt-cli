@@ -23,17 +23,26 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-# Find project root
+# Find project root (main repo, not worktree)
 find_project_root() {
-  local dir="$PWD"
-  if [[ -f "$dir/.git" ]]; then
-    dir=$(cat "$dir/.git" | sed 's/gitdir: //' | sed 's/\.git\/worktrees\/.*//')
-  elif [[ -d "$dir/.git" ]]; then
-    dir="$dir"
-  else
-    dir=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+  # First find git root (could be worktree or main repo)
+  local git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [[ -z "$git_root" ]]; then
+    echo ""
+    return
   fi
-  echo "$dir"
+  
+  # Check if this is a worktree (has .git file instead of .git directory)
+  if [[ -f "$git_root/.git" ]]; then
+    # It's a worktree - extract main repo path from .git file
+    # .git file contains: gitdir: /path/to/main-repo/.git/worktrees/worktree-name
+    local gitdir=$(cat "$git_root/.git" | sed 's/gitdir: //')
+    # Extract main repo path
+    echo "$gitdir" | sed 's/\/\.git\/worktrees\/.*//'
+  else
+    # It's the main repo
+    echo "$git_root"
+  fi
 }
 
 PROJECT_ROOT=$(find_project_root)
@@ -166,19 +175,17 @@ run_flutter() {
   eval $flutter_cmd
   
   # Flutter exited (user pressed 'q')
+  echo ""
+  echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${GREEN}🔄 Flutter exited. Returning to worktree selection...${NC}"
+  echo -e "${DIM}   (Press any key to continue)${NC}"
+  echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  read -rsn1
   return 0
 }
 
 # Main loop
 main() {
-  load_worktrees
-  
-  if [[ ${#WT_NAMES[@]} -eq 0 ]]; then
-    echo -e "${RED}❌ No Flutter worktrees found${NC}"
-    echo -e "${DIM}   Make sure pubspec.yaml exists in your worktrees${NC}"
-    exit 1
-  fi
-  
   # Auto-detect device if not specified
   if [[ -z "$DEVICE" ]]; then
     echo -e "${YELLOW}🔍 Detecting devices...${NC}"
@@ -192,17 +199,35 @@ main() {
   fi
   
   local current_idx=0
-  
-  # Check if we're already in a worktree
-  for i in "${!WT_PATHS[@]}"; do
-    if [[ "$PWD" == "${WT_PATHS[$i]}"* ]]; then
-      current_idx=$i
-      break
-    fi
-  done
+  local initial_pwd="$PWD"
   
   # Main selection loop
   while true; do
+    # Reload worktrees every iteration (auto-detect new worktrees)
+    load_worktrees
+    
+    if [[ ${#WT_NAMES[@]} -eq 0 ]]; then
+      echo -e "${RED}❌ No Flutter worktrees found${NC}"
+      echo -e "${DIM}   Make sure pubspec.yaml exists in your worktrees${NC}"
+      exit 1
+    fi
+    
+    # Adjust current_idx if out of bounds (worktree was deleted)
+    if [[ $current_idx -ge ${#WT_NAMES[@]} ]]; then
+      current_idx=0
+    fi
+    
+    # Check if we're in a worktree (first iteration only)
+    if [[ -n "$initial_pwd" ]]; then
+      for i in "${!WT_PATHS[@]}"; do
+        if [[ "$initial_pwd" == "${WT_PATHS[$i]}"* ]]; then
+          current_idx=$i
+          break
+        fi
+      done
+      initial_pwd=""
+    fi
+    
     clear
     print_banner "${WT_NAMES[$current_idx]}"
     print_menu "${WT_NAMES[$current_idx]}"
