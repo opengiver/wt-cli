@@ -4,7 +4,7 @@
 
 set -e
 
-REPO="lbo728/wt-cli"
+REPO="opengiver/wt-cli"
 INSTALL_DIR="$HOME/.local/bin"
 
 echo "🚀 Installing wt-cli..."

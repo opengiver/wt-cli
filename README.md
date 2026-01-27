@@ -9,33 +9,33 @@ Prevent branch conflicts when multiple agents/developers work simultaneously on 
 ### npm (Recommended for developers)
 
 ```bash
-npm install -g wt-cli
+npm install -g @opengiver/wt-cli
 ```
 
 ### Homebrew (macOS)
 
 ```bash
-brew install lbo728/wt-cli/wt-cli
+brew install opengiver/wt-cli/wt-cli
 ```
 
 Or with tap:
 
 ```bash
-brew tap lbo728/wt-cli
+brew tap opengiver/wt-cli
 brew install wt-cli
 ```
 
 ### curl (One-liner)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lbo728/wt-cli/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/opengiver/wt-cli/main/install.sh | bash
 ```
 
 ### Manual
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lbo728/wt-cli/main/bin/wt -o ~/.local/bin/wt
-curl -fsSL https://raw.githubusercontent.com/lbo728/wt-cli/main/bin/wtf -o ~/.local/bin/wtf
+curl -fsSL https://raw.githubusercontent.com/opengiver/wt-cli/main/bin/wt -o ~/.local/bin/wt
+curl -fsSL https://raw.githubusercontent.com/opengiver/wt-cli/main/bin/wtf -o ~/.local/bin/wtf
 chmod +x ~/.local/bin/wt ~/.local/bin/wtf
 ```
 
