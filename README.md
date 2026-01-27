@@ -51,6 +51,8 @@ wt open <name>     # Open worktree in browser
 wt dev-all         # Start all dev servers in tmux
 wt attach          # Attach to tmux session
 wt stop [name]     # Stop dev server(s)
+wt link-env [name] # Link .env files from main repo to worktree
+wt link-env-all    # Link .env files to all worktrees
 wt help            # Show help
 ```
 
@@ -75,10 +77,13 @@ wtf "iPhone 15"    # Start with specific device
 git worktree add -b feature/auth ../my-app-worktrees/feature-auth main
 git worktree add -b feature/ui ../my-app-worktrees/feature-ui main
 
-# 2. Check status
+# 2. Link .env files (required for builds)
+wt link-env-all
+
+# 3. Check status
 wt ls
 
-# 3. Start all dev servers
+# 4. Start all dev servers
 wt dev-all
 
 # 4. Switch between worktrees in tmux
@@ -98,6 +103,7 @@ wtf
 - **Port auto-assignment**: Each worktree gets unique port (3000, 3001, ...)
 - **tmux integration**: Manage all dev servers in one session
 - **Flutter switcher**: Quick switching between worktrees on single device
+- **Env file linking**: Symlink `.env`, `.env.*`, secrets from main repo to worktrees
 
 ## Requirements
 

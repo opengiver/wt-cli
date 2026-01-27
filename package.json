@@ -1,6 +1,6 @@
 {
   "name": "@opengiver/wt-cli",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Git worktree management CLI for parallel development",
   "bin": {
     "wt": "./bin/wt",

@@ -22,23 +22,26 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Find project root and worktrees directory
+# Find project root (main repo, not worktree)
 find_project_root() {
-  local dir="$PWD"
-  
-  # If we're in a worktree, find the main repo
-  if [[ -f "$dir/.git" ]]; then
-    # This is a worktree, .git is a file pointing to main repo
-    dir=$(cat "$dir/.git" | sed 's/gitdir: //' | sed 's/\.git\/worktrees\/.*//')
-  elif [[ -d "$dir/.git" ]]; then
-    # This is the main repo
-    dir="$dir"
-  else
-    # Try to find git root
-    dir=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+  # First find git root (could be worktree or main repo)
+  local git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [[ -z "$git_root" ]]; then
+    echo ""
+    return
   fi
   
-  echo "$dir"
+  # Check if this is a worktree (has .git file instead of .git directory)
+  if [[ -f "$git_root/.git" ]]; then
+    # It's a worktree - extract main repo path from .git file
+    # .git file contains: gitdir: /path/to/main-repo/.git/worktrees/worktree-name
+    local gitdir=$(cat "$git_root/.git" | sed 's/gitdir: //')
+    # Extract main repo path
+    echo "$gitdir" | sed 's/\/\.git\/worktrees\/.*//'
+  else
+    # It's the main repo
+    echo "$git_root"
+  fi
 }
 
 PROJECT_ROOT=$(find_project_root)
@@ -420,6 +423,94 @@ cmd_open() {
   open "$url" 2>/dev/null || xdg-open "$url" 2>/dev/null || echo "Open manually: $url"
 }
 
+# Link environment files from main repo to worktree
+cmd_link_env() {
+  local target_wt="$1"
+  local target_dir
+  
+  if [[ -z "$target_wt" ]]; then
+    # Use current directory (must be in a worktree)
+    target_dir=$(git rev-parse --show-toplevel 2>/dev/null)
+  else
+    target_dir="$WORKTREES_DIR/$target_wt"
+  fi
+  
+  if [[ ! -d "$target_dir" ]]; then
+    echo -e "${RED}Worktree not found: $target_dir${NC}"
+    exit 1
+  fi
+  
+  # Check if target is actually a worktree (not main repo)
+  if [[ ! -f "$target_dir/.git" ]]; then
+    if [[ "$target_dir" == "$PROJECT_ROOT" ]]; then
+      echo -e "${YELLOW}Already in main repo, no need to link env files${NC}"
+      return
+    fi
+  fi
+  
+  echo -e "${CYAN}🔗 Linking environment files...${NC}"
+  echo -e "   From: ${BLUE}$PROJECT_ROOT${NC}"
+  echo -e "   To:   ${BLUE}$target_dir${NC}"
+  echo ""
+  
+  # Common env file patterns
+  local env_patterns=(".env" ".env.*" "*.local" "google-services.json" "GoogleService-Info.plist" ".secret*")
+  local linked=0
+  
+  # Search in main repo (including subdirectories up to depth 4)
+  for pattern in "${env_patterns[@]}"; do
+    while IFS= read -r -d '' file; do
+      # Get relative path from PROJECT_ROOT
+      local rel_path="${file#$PROJECT_ROOT/}"
+      local target_file="$target_dir/$rel_path"
+      
+      # Check if file is in .gitignore (only link ignored files)
+      if git -C "$PROJECT_ROOT" check-ignore -q "$file" 2>/dev/null; then
+        # Skip if already exists (file or symlink)
+        if [[ -e "$target_file" ]] || [[ -L "$target_file" ]]; then
+          echo -e "  ${YELLOW}⏭${NC}  $rel_path (already exists)"
+          continue
+        fi
+        
+        # Create parent directory if needed
+        mkdir -p "$(dirname "$target_file")"
+        
+        # Create symlink
+        ln -s "$file" "$target_file"
+        echo -e "  ${GREEN}✅${NC} $rel_path"
+        ((linked++))
+      fi
+    done < <(find "$PROJECT_ROOT" -maxdepth 4 -type f -name "$pattern" -print0 2>/dev/null)
+  done
+  
+  echo ""
+  if [[ $linked -eq 0 ]]; then
+    echo -e "${YELLOW}No new env files to link${NC}"
+  else
+    echo -e "${GREEN}Linked $linked file(s)${NC}"
+  fi
+}
+
+# Link env files to all worktrees
+cmd_link_env_all() {
+  echo -e "${CYAN}🔗 Linking environment files to all worktrees...${NC}"
+  echo ""
+  
+  if [[ ! -d "$WORKTREES_DIR" ]]; then
+    echo -e "${YELLOW}No worktrees found${NC}"
+    return
+  fi
+  
+  for wt in "$WORKTREES_DIR"/*/; do
+    if [[ -d "$wt" ]]; then
+      local name=$(basename "$wt")
+      echo -e "${BLUE}[$name]${NC}"
+      cmd_link_env "$name"
+      echo ""
+    fi
+  done
+}
+
 # Show help
 cmd_help() {
   echo -e "${CYAN}wt - Worktree Management CLI${NC}"
@@ -436,6 +527,8 @@ cmd_help() {
   echo "  attach            Attach to tmux session"
   echo "  ports             Show port assignments"
   echo "  open [name]       Open in browser"
+  echo "  link-env [name]   Link .env files from main repo to worktree"
+  echo "  link-env-all      Link .env files to all worktrees"
   echo ""
   echo "tmux Shortcuts (after 'wt attach'):"
   echo "  Ctrl+b, n         Next window (next worktree)"
@@ -478,6 +571,12 @@ case "${1:-help}" in
     ;;
   open)
     cmd_open "$2"
+    ;;
+  link-env)
+    cmd_link_env "$2"
+    ;;
+  link-env-all)
+    cmd_link_env_all
     ;;
   help|--help|-h)
     cmd_help
