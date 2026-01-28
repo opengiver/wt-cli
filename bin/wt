@@ -696,8 +696,19 @@ load_worktrees_interactive() {
   WT_PATHS=()
   WT_PORTS=()
   
+  local index=0
+  
+  # Add main project
+  local main_type=$(detect_project_type "$PROJECT_ROOT")
+  if [[ "$main_type" != "generic" ]]; then
+    WT_NAMES+=("main")
+    WT_PATHS+=("$PROJECT_ROOT")
+    WT_PORTS+=("$((BASE_PORT + index))")
+    ((index++))
+  fi
+  
+  # Add worktrees
   if [[ -d "$WORKTREES_DIR" ]]; then
-    local index=0
     for wt in "$WORKTREES_DIR"/*/; do
       if [[ -d "$wt" ]]; then
         local name=$(basename "$wt")
@@ -764,7 +775,7 @@ run_interactive_selector() {
     
     printf '\033[H\033[J'
     
-    echo -e "${MAGENTA}━━${NC} ${BOLD}🌳 wt${NC} ${DIM}($PROJECT_NAME)${NC} ${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${MAGENTA}━━${NC} ${BOLD}🌳 wt${NC} ${DIM}($PROJECT_NAME)${NC} ${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     if [[ -n "$current_wt" ]]; then
       local current_port=""
       for i in "${!WT_NAMES[@]}"; do
@@ -773,41 +784,33 @@ run_interactive_selector() {
           break
         fi
       done
-      echo -e "${GREEN}▶${NC} ${BOLD}$current_wt${NC} ${DIM}| localhost:$current_port${NC}"
+      echo -e "${GREEN}▶${NC} ${BOLD}$current_wt${NC} ${DIM}| :$current_port${NC}"
     else
-      echo -e "${DIM}Select a worktree to start dev server${NC}"
+      echo -e "${DIM}No active worktree${NC}"
     fi
     echo ""
     
     for i in "${!WT_NAMES[@]}"; do
       local name="${WT_NAMES[$i]}"
-      local port="${WT_PORTS[$i]}"
       local num=$((i + 1))
-      local port_status=""
-      
-      if is_port_in_use "$port"; then
-        port_status="${GREEN}●${NC} :$port"
-      else
-        port_status="${DIM}○ :$port${NC}"
-      fi
       
       if [[ $i -eq $selected_idx ]]; then
         if [[ "$name" == "$current_wt" ]]; then
-          echo -e "  ${GREEN}${BOLD}▶ [$num] $name${NC} $port_status ${DIM}← active${NC}"
+          echo -e "  ${GREEN}${BOLD}▶ [$num] $name${NC} ${DIM}← running${NC}"
         else
-          echo -e "  ${CYAN}${BOLD}▶ [$num] $name${NC} $port_status"
+          echo -e "  ${CYAN}${BOLD}▶ [$num] $name${NC}"
         fi
       else
         if [[ "$name" == "$current_wt" ]]; then
-          echo -e "    ${GREEN}[$num] $name${NC} $port_status ${DIM}← active${NC}"
+          echo -e "    ${GREEN}[$num] $name${NC} ${DIM}← running${NC}"
         else
-          echo -e "    ${DIM}[$num]${NC} $name $port_status"
+          echo -e "    ${DIM}[$num]${NC} $name"
         fi
       fi
     done
     
     echo ""
-    echo -e "${DIM}[↑↓] Move  [Enter] Start  [Tab] Server pane  [q] Quit${NC}"
+    echo -e "${DIM}[↑↓] Move  [Enter] Switch  [Tab] Dev pane  [q] Quit${NC}"
     
     local key_action=$(read_key)
     
@@ -826,27 +829,40 @@ run_interactive_selector() {
           selected_idx=0
         fi
         ;;
-      ENTER|NUM_*)
-        local idx=$selected_idx
-        if [[ "$key_action" == NUM_* ]]; then
-          local num=${key_action#NUM_}
-          idx=$((num - 1))
-          if [[ $idx -ge ${#WT_NAMES[@]} ]]; then
-            continue
-          fi
-          selected_idx=$idx
+      ENTER)
+        if [[ ${#WT_NAMES[@]} -gt 0 ]]; then
+          local wt_name="${WT_NAMES[$selected_idx]}"
+          local wt_path="${WT_PATHS[$selected_idx]}"
+          local wt_port="${WT_PORTS[$selected_idx]}"
+          current_wt="$wt_name"
+          
+          local dev_cmd=$(get_dev_command "$wt_path" "$wt_port")
+          
+          tmux set-option -t "$session_name" status-right " 📂 $wt_name " 2>/dev/null || true
+          
+          tmux send-keys -t "${session_name}:0.1" C-c 2>/dev/null || true
+          sleep 0.3
+          tmux send-keys -t "${session_name}:0.1" "cd \"$wt_path\" && $dev_cmd" Enter 2>/dev/null || true
         fi
-        
-        local wt_name="${WT_NAMES[$idx]}"
-        local wt_path="${WT_PATHS[$idx]}"
-        local wt_port="${WT_PORTS[$idx]}"
-        current_wt="$wt_name"
-        
-        local dev_cmd=$(get_dev_command "$wt_path" "$wt_port")
-        
-        tmux send-keys -t "${session_name}:0.1" C-c 2>/dev/null || true
-        sleep 0.3
-        tmux send-keys -t "${session_name}:0.1" "cd \"$wt_path\" && $dev_cmd" Enter 2>/dev/null || true
+        ;;
+      NUM_*)
+        local num=${key_action#NUM_}
+        local idx=$((num - 1))
+        if [[ $idx -lt ${#WT_NAMES[@]} ]]; then
+          selected_idx=$idx
+          local wt_name="${WT_NAMES[$idx]}"
+          local wt_path="${WT_PATHS[$idx]}"
+          local wt_port="${WT_PORTS[$idx]}"
+          current_wt="$wt_name"
+          
+          local dev_cmd=$(get_dev_command "$wt_path" "$wt_port")
+          
+          tmux set-option -t "$session_name" status-right " 📂 $wt_name " 2>/dev/null || true
+          
+          tmux send-keys -t "${session_name}:0.1" C-c 2>/dev/null || true
+          sleep 0.3
+          tmux send-keys -t "${session_name}:0.1" "cd \"$wt_path\" && $dev_cmd" Enter 2>/dev/null || true
+        fi
         ;;
       TAB)
         tmux select-pane -t "${session_name}:0.1" 2>/dev/null || true
@@ -880,7 +896,8 @@ cmd_interactive() {
   tmux set-option -t "$INTERACTIVE_SESSION" status-style "bg=cyan,fg=black,bold"
   tmux set-option -t "$INTERACTIVE_SESSION" status-left " 🌳 wt | "
   tmux set-option -t "$INTERACTIVE_SESSION" status-left-length 20
-  tmux set-option -t "$INTERACTIVE_SESSION" status-right " $PROJECT_NAME "
+  tmux set-option -t "$INTERACTIVE_SESSION" status-right " 📂 (none) "
+  tmux set-option -t "$INTERACTIVE_SESSION" status-right-length 50
   tmux set-option -t "$INTERACTIVE_SESSION" mouse on
   tmux bind-key -n Tab select-pane -t :.+
   
@@ -891,8 +908,8 @@ cmd_interactive() {
   
   tmux split-window -v -t "$INTERACTIVE_SESSION" -p 70 "bash"
   
-  tmux select-pane -t "${INTERACTIVE_SESSION}:0.0" -T "📋 Worktrees"
-  tmux select-pane -t "${INTERACTIVE_SESSION}:0.1" -T "🚀 Dev Server"
+  tmux select-pane -t "${INTERACTIVE_SESSION}:0.0" -T "📋 Worktree"
+  tmux select-pane -t "${INTERACTIVE_SESSION}:0.1" -T "🚀 Dev"
   
   tmux select-pane -t "${INTERACTIVE_SESSION}:0.0"
   
