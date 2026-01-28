@@ -875,17 +875,146 @@ run_interactive_selector() {
   done
 }
 
+run_interactive_selector_inline() {
+  local selected_idx=0
+  local current_wt=""
+  
+  printf '\033[?1049h'
+  trap 'printf "\033[?1049l\033[?25h"' EXIT
+  printf '\033[?25l'
+  
+  while true; do
+    load_worktrees_interactive
+    
+    if [[ ${#WT_NAMES[@]} -eq 0 ]]; then
+      printf '\033[H\033[J'
+      echo -e "${RED}❌ No worktrees found${NC}"
+      sleep 2
+      continue
+    fi
+    
+    if [[ $selected_idx -ge ${#WT_NAMES[@]} ]]; then
+      selected_idx=$((${#WT_NAMES[@]} - 1))
+    fi
+    
+    printf '\033[H\033[J'
+    
+    echo -e "${MAGENTA}━━${NC} ${BOLD}🌳 wt${NC} ${DIM}($PROJECT_NAME)${NC} ${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if [[ -n "$current_wt" ]]; then
+      echo -e "${GREEN}▶${NC} ${BOLD}$current_wt${NC}"
+    else
+      echo -e "${DIM}No active worktree${NC}"
+    fi
+    echo ""
+    
+    for i in "${!WT_NAMES[@]}"; do
+      local name="${WT_NAMES[$i]}"
+      local num=$((i + 1))
+      
+      if [[ $i -eq $selected_idx ]]; then
+        if [[ "$name" == "$current_wt" ]]; then
+          echo -e "  ${GREEN}${BOLD}▶ [$num] $name${NC} ${DIM}← running${NC}"
+        else
+          echo -e "  ${CYAN}${BOLD}▶ [$num] $name${NC}"
+        fi
+      else
+        if [[ "$name" == "$current_wt" ]]; then
+          echo -e "    ${GREEN}[$num] $name${NC} ${DIM}← running${NC}"
+        else
+          echo -e "    ${DIM}[$num]${NC} $name"
+        fi
+      fi
+    done
+    
+    echo ""
+    echo -e "${DIM}[↑↓] Move  [Enter] Switch  [Tab] Dev pane  [q] Quit${NC}"
+    
+    local key_action=$(read_key)
+    
+    case "$key_action" in
+      UP)
+        if [[ $selected_idx -gt 0 ]]; then
+          ((selected_idx--))
+        else
+          selected_idx=$((${#WT_NAMES[@]} - 1))
+        fi
+        ;;
+      DOWN)
+        if [[ $selected_idx -lt $((${#WT_NAMES[@]} - 1)) ]]; then
+          ((selected_idx++))
+        else
+          selected_idx=0
+        fi
+        ;;
+      ENTER)
+        if [[ ${#WT_NAMES[@]} -gt 0 ]]; then
+          local wt_name="${WT_NAMES[$selected_idx]}"
+          local wt_path="${WT_PATHS[$selected_idx]}"
+          local wt_port="${WT_PORTS[$selected_idx]}"
+          current_wt="$wt_name"
+          
+          local dev_cmd=$(get_dev_command "$wt_path" "$wt_port")
+          
+          tmux send-keys -t :.+ C-c 2>/dev/null || true
+          sleep 0.3
+          tmux send-keys -t :.+ "cd \"$wt_path\" && $dev_cmd" Enter 2>/dev/null || true
+        fi
+        ;;
+      NUM_*)
+        local num=${key_action#NUM_}
+        local idx=$((num - 1))
+        if [[ $idx -lt ${#WT_NAMES[@]} ]]; then
+          selected_idx=$idx
+          local wt_name="${WT_NAMES[$idx]}"
+          local wt_path="${WT_PATHS[$idx]}"
+          local wt_port="${WT_PORTS[$idx]}"
+          current_wt="$wt_name"
+          
+          local dev_cmd=$(get_dev_command "$wt_path" "$wt_port")
+          
+          tmux send-keys -t :.+ C-c 2>/dev/null || true
+          sleep 0.3
+          tmux send-keys -t :.+ "cd \"$wt_path\" && $dev_cmd" Enter 2>/dev/null || true
+        fi
+        ;;
+      TAB)
+        tmux select-pane -t :.+ 2>/dev/null || true
+        ;;
+      QUIT)
+        exit 0
+        ;;
+    esac
+  done
+}
+
+start_tmux_split_mode() {
+  local script_path=$(realpath "$0")
+  local current_pane=$(tmux display-message -p '#{pane_id}')
+  local original_pane="$current_pane"
+  
+  tmux split-window -v -b -p 30 -t "$current_pane" \
+    "\"$script_path\" --interactive-selector-inline"
+  
+  local selector_pane=$(tmux display-message -p '#{pane_id}')
+  
+  tmux select-pane -t "$selector_pane" -T "📋 Worktree"
+  tmux select-pane -t "$original_pane" -T "🚀 Dev"
+  
+  tmux set-option pane-border-style "fg=colour240"
+  tmux set-option pane-active-border-style "fg=colour51"
+  tmux set-option pane-border-status top
+  tmux set-option pane-border-format " #{?pane_active,#[fg=colour51]▶ ,  }#[fg=white,bold]#{pane_title}#[default] "
+  
+  tmux bind-key -n Tab select-pane -t :.+
+  
+  tmux select-pane -t "$selector_pane"
+}
+
 cleanup_interactive() {
   tmux kill-session -t "$INTERACTIVE_SESSION" 2>/dev/null || true
 }
 
-cmd_interactive() {
-  if ! command -v tmux &>/dev/null; then
-    echo -e "${RED}tmux required for interactive mode${NC}"
-    echo -e "${DIM}Install: brew install tmux${NC}"
-    exit 1
-  fi
-  
+start_tmux_new_session() {
   trap cleanup_interactive EXIT
   
   local script_path=$(realpath "$0")
@@ -914,6 +1043,22 @@ cmd_interactive() {
   tmux select-pane -t "${INTERACTIVE_SESSION}:0.0"
   
   tmux attach-session -t "$INTERACTIVE_SESSION"
+}
+
+cmd_interactive() {
+  if ! command -v tmux &>/dev/null; then
+    echo -e "${RED}tmux required for interactive mode${NC}"
+    echo -e "${DIM}Install: brew install tmux${NC}"
+    exit 1
+  fi
+  
+  if [[ -n "$TMUX" ]]; then
+    echo -e "${GREEN}✓ Already in tmux - splitting current window${NC}"
+    sleep 0.5
+    start_tmux_split_mode
+  else
+    start_tmux_new_session
+  fi
 }
 
 SHELL_INTEGRATION='
@@ -1016,6 +1161,10 @@ case "${1:-}" in
   --interactive-selector)
     shift
     run_interactive_selector "$@"
+    exit 0
+    ;;
+  --interactive-selector-inline)
+    run_interactive_selector_inline
     exit 0
     ;;
   "")
