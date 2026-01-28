@@ -4,11 +4,17 @@
 #
 # Usage: wtf [device-id]
 #
-# Inside wtf session:
-#   1-9: Switch to worktree
-#   r: Hot reload
-#   R: Hot restart  
-#   q: Quit flutter (then pick new worktree or exit)
+# Features:
+#   - Arrow key navigation (↑/↓) + Enter to select
+#   - Number keys (1-9) to jump directly
+#   - tmux split mode: Navigate worktree list while Flutter runs
+#   - Fallback mode: Classic menu-based selection
+#
+# Controls:
+#   ↑/↓: Navigate worktree list
+#   Enter: Select and run/switch
+#   1-9: Jump directly to worktree
+#   q: Quit
 
 set -e
 
@@ -23,24 +29,21 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
+# tmux session name
+TMUX_SESSION="wtf-$$"
+
 # Find project root (main repo, not worktree)
 find_project_root() {
-  # First find git root (could be worktree or main repo)
   local git_root=$(git rev-parse --show-toplevel 2>/dev/null)
   if [[ -z "$git_root" ]]; then
     echo ""
     return
   fi
   
-  # Check if this is a worktree (has .git file instead of .git directory)
   if [[ -f "$git_root/.git" ]]; then
-    # It's a worktree - extract main repo path from .git file
-    # .git file contains: gitdir: /path/to/main-repo/.git/worktrees/worktree-name
     local gitdir=$(cat "$git_root/.git" | sed 's/gitdir: //')
-    # Extract main repo path
     echo "$gitdir" | sed 's/\/\.git\/worktrees\/.*//'
   else
-    # It's the main repo
     echo "$git_root"
   fi
 }
@@ -55,11 +58,10 @@ PROJECT_NAME=$(basename "$PROJECT_ROOT")
 WORKTREES_DIR="$(dirname "$PROJECT_ROOT")/${PROJECT_NAME}-worktrees"
 DEVICE="${1:-}"
 
-# Get list of worktrees as array
 declare -a WT_NAMES
 declare -a WT_PATHS
 
-# Find Flutter app directory (checks root and common subdirectories)
+# Find Flutter app directory
 find_flutter_dir() {
   local dir="${1:-$PWD}"
   local check_dirs=("$dir" "$dir/app" "$dir/src" "$dir/client" "$dir/frontend" "$dir/mobile")
@@ -78,14 +80,12 @@ load_worktrees() {
   WT_NAMES=()
   WT_PATHS=()
   
-  # Add main project if it's a Flutter project (check subdirectories too)
   local main_flutter_dir=$(find_flutter_dir "$PROJECT_ROOT")
   if [[ -n "$main_flutter_dir" ]]; then
     WT_NAMES+=("main")
     WT_PATHS+=("$main_flutter_dir")
   fi
   
-  # Add worktrees
   if [[ -d "$WORKTREES_DIR" ]]; then
     for wt in "$WORKTREES_DIR"/*/; do
       if [[ -d "$wt" ]]; then
@@ -100,7 +100,19 @@ load_worktrees() {
   fi
 }
 
-# Print banner
+# Print compact header for tmux top pane
+print_compact_header() {
+  local current="$1"
+  echo -e "${MAGENTA}━━${NC} ${BOLD}🦋 wtf${NC} ${DIM}($PROJECT_NAME)${NC} ${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  if [[ -n "$current" ]]; then
+    echo -e "${GREEN}▶${NC} ${BOLD}$current${NC} ${DIM}${DEVICE:+| 📱 $DEVICE}${NC}"
+  else
+    echo -e "${DIM}No active worktree${NC}"
+  fi
+  echo ""
+}
+
+# Print full banner
 print_banner() {
   local current="$1"
   echo ""
@@ -117,12 +129,16 @@ print_banner() {
   echo ""
 }
 
-# Print menu
+# Print menu with arrow key navigation
 print_menu() {
   local current="$1"
+  local selected_idx="${2:-0}"
+  local compact="${3:-false}"
   
-  echo -e "${BOLD}  Select worktree to debug:${NC}"
-  echo ""
+  if [[ "$compact" != "true" ]]; then
+    echo -e "${BOLD}  Select worktree to debug:${NC}"
+    echo ""
+  fi
   
   for i in "${!WT_NAMES[@]}"; do
     local name="${WT_NAMES[$i]}"
@@ -130,23 +146,69 @@ print_menu() {
     local branch=$(cd "$path" && git branch --show-current 2>/dev/null || echo "unknown")
     local num=$((i + 1))
     
-    if [[ "$name" == "$current" ]]; then
-      echo -e "  ${GREEN}▶ [$num] $name${NC} ${DIM}← running${NC}"
-      echo -e "       ${CYAN}$branch${NC}"
+    if [[ $i -eq $selected_idx ]]; then
+      if [[ "$name" == "$current" ]]; then
+        echo -e "  ${GREEN}${BOLD}▶ [$num] $name${NC} ${DIM}← running${NC}"
+      else
+        echo -e "  ${CYAN}${BOLD}▶ [$num] $name${NC}"
+      fi
+      if [[ "$compact" != "true" ]]; then
+        echo -e "       ${CYAN}$branch${NC}"
+      fi
     else
-      echo -e "    ${BOLD}[$num]${NC} $name"
-      echo -e "       ${DIM}$branch${NC}"
+      if [[ "$name" == "$current" ]]; then
+        echo -e "    ${GREEN}[$num] $name${NC} ${DIM}← running${NC}"
+        if [[ "$compact" != "true" ]]; then
+          echo -e "       ${CYAN}$branch${NC}"
+        fi
+      else
+        echo -e "    ${DIM}[$num]${NC} $name"
+        if [[ "$compact" != "true" ]]; then
+          echo -e "       ${DIM}$branch${NC}"
+        fi
+      fi
     fi
   done
   
   echo ""
   echo -e "  ${DIM}────────────────────────────────────────────────────${NC}"
-  echo -e "  ${BOLD}[1-${#WT_NAMES[@]}]${NC} Select   ${BOLD}[q]${NC} Quit"
+  echo -e "  ${BOLD}[↑↓]${NC} Navigate   ${BOLD}[Enter]${NC} Run   ${BOLD}[1-${#WT_NAMES[@]}]${NC} Jump   ${BOLD}[q]${NC} Quit"
   echo ""
 }
 
-# Run flutter for selected worktree
-run_flutter() {
+# Read single keypress with arrow key support
+# Returns "TIMEOUT" if no key pressed within timeout
+read_key() {
+  local key
+  # Use 1 second timeout for periodic refresh
+  if ! IFS= read -rsn1 -t 1 key 2>/dev/null; then
+    echo "TIMEOUT"
+    return
+  fi
+  
+  if [[ "$key" == $'\033' ]]; then
+    # Read escape sequence
+    read -rsn2 -t 1 key 2>/dev/null || true
+    case "$key" in
+      '[A') echo "UP" ;;
+      '[B') echo "DOWN" ;;
+      *) echo "ESC" ;;
+    esac
+  elif [[ "$key" == "" ]]; then
+    echo "ENTER"
+  elif [[ "$key" == $'\t' ]]; then
+    echo "TAB"
+  elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+    echo "QUIT"
+  elif [[ "$key" =~ ^[1-9]$ ]]; then
+    echo "NUM_$key"
+  else
+    echo "OTHER"
+  fi
+}
+
+# Run flutter for selected worktree (classic mode)
+run_flutter_classic() {
   local wt_name="$1"
   local wt_path="$2"
   
@@ -165,16 +227,13 @@ run_flutter() {
   
   cd "$wt_path"
   
-  # Build flutter command
   local flutter_cmd="flutter run"
   if [[ -n "$DEVICE" ]]; then
     flutter_cmd="$flutter_cmd -d \"$DEVICE\""
   fi
   
-  # Run flutter (user can interact with it directly)
   eval $flutter_cmd
   
-  # Flutter exited (user pressed 'q')
   echo ""
   echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo -e "${GREEN}🔄 Flutter exited. Returning to worktree selection...${NC}"
@@ -184,26 +243,356 @@ run_flutter() {
   return 0
 }
 
-# Main loop
-main() {
-  # Auto-detect device if not specified
-  if [[ -z "$DEVICE" ]]; then
-    echo -e "${YELLOW}🔍 Detecting devices...${NC}"
-    # Try to get first available device
-    DEVICE=$(flutter devices 2>/dev/null | grep -E "•|•" | head -1 | awk -F'•' '{print $2}' | xargs)
-    if [[ -z "$DEVICE" ]]; then
-      echo -e "${YELLOW}⚠️  No device specified, Flutter will auto-select${NC}"
-    else
-      echo -e "${GREEN}📱 Using device: $DEVICE${NC}"
+# ═══════════════════════════════════════════════════════════════════════════════
+# TMUX MODE - Split view with always-visible worktree list
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cleanup_tmux() {
+  tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+}
+
+# Top pane: Worktree selector (runs interactively)
+run_tmux_selector() {
+  local session_name="$1"
+  local device="$2"
+  local selected_idx=0
+  local current_wt=""
+  
+  # Use alternate screen buffer (prevents scrollback accumulation)
+  printf '\033[?1049h'
+  
+  # Cleanup on exit - restore screen and show cursor
+  trap 'printf "\033[?1049l\033[?25h"' EXIT
+  
+  # Hide cursor for cleaner UI
+  printf '\033[?25l'
+  
+  while true; do
+    load_worktrees
+    
+    if [[ ${#WT_NAMES[@]} -eq 0 ]]; then
+      echo -e "${RED}❌ No Flutter worktrees found${NC}"
+      sleep 2
+      continue
     fi
+    
+    # Clamp selected_idx
+    if [[ $selected_idx -ge ${#WT_NAMES[@]} ]]; then
+      selected_idx=$((${#WT_NAMES[@]} - 1))
+    fi
+    
+    # Clear screen (alternate buffer has no scrollback)
+    printf '\033[H\033[J'
+    # Compact header for tmux mode
+    echo -e "${MAGENTA}━━${NC} ${BOLD}🦋 wtf${NC} ${DIM}($PROJECT_NAME)${NC} ${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if [[ -n "$current_wt" ]]; then
+      echo -e "${GREEN}▶${NC} ${BOLD}$current_wt${NC} ${DIM}${device:+| 📱 $device}${NC}"
+    else
+      echo -e "${DIM}No active worktree${NC}"
+    fi
+    echo ""
+    
+    # Print worktree list
+    for i in "${!WT_NAMES[@]}"; do
+      local name="${WT_NAMES[$i]}"
+      local num=$((i + 1))
+      
+      if [[ $i -eq $selected_idx ]]; then
+        if [[ "$name" == "$current_wt" ]]; then
+          echo -e "  ${GREEN}${BOLD}▶ [$num] $name${NC} ${DIM}← running${NC}"
+        else
+          echo -e "  ${CYAN}${BOLD}▶ [$num] $name${NC}"
+        fi
+      else
+        if [[ "$name" == "$current_wt" ]]; then
+          echo -e "    ${GREEN}[$num] $name${NC} ${DIM}← running${NC}"
+        else
+          echo -e "    ${DIM}[$num]${NC} $name"
+        fi
+      fi
+    done
+    
+    echo ""
+    echo -e "${DIM}[↑↓] Move  [Enter] Switch  [Tab] Flutter pane  [q] Quit${NC}"
+    
+    # Read key
+    local key_action=$(read_key)
+    
+    case "$key_action" in
+      UP)
+        if [[ $selected_idx -gt 0 ]]; then
+          ((selected_idx--))
+        else
+          selected_idx=$((${#WT_NAMES[@]} - 1))
+        fi
+        ;;
+      DOWN)
+        if [[ $selected_idx -lt $((${#WT_NAMES[@]} - 1)) ]]; then
+          ((selected_idx++))
+        else
+          selected_idx=0
+        fi
+        ;;
+      ENTER)
+        if [[ ${#WT_NAMES[@]} -gt 0 ]]; then
+          local wt_name="${WT_NAMES[$selected_idx]}"
+          local wt_path="${WT_PATHS[$selected_idx]}"
+          current_wt="$wt_name"
+          
+          # Update tmux status bar with worktree name
+          tmux set-option -t "$session_name" status-right " 📂 $wt_name " 2>/dev/null || true
+          
+          # Send command to bottom pane
+          tmux send-keys -t "${session_name}:0.1" C-c 2>/dev/null || true
+          sleep 0.3
+          if [[ -n "$device" ]]; then
+            tmux send-keys -t "${session_name}:0.1" "cd \"$wt_path\" && flutter run -d \"$device\"" Enter 2>/dev/null || true
+          else
+            tmux send-keys -t "${session_name}:0.1" "cd \"$wt_path\" && flutter run" Enter 2>/dev/null || true
+          fi
+        fi
+        ;;
+      NUM_*)
+        local num=${key_action#NUM_}
+        local idx=$((num - 1))
+        if [[ $idx -lt ${#WT_NAMES[@]} ]]; then
+          selected_idx=$idx
+          local wt_name="${WT_NAMES[$idx]}"
+          local wt_path="${WT_PATHS[$idx]}"
+          current_wt="$wt_name"
+          
+          # Update tmux status bar with worktree name
+          tmux set-option -t "$session_name" status-right " 📂 $wt_name " 2>/dev/null || true
+          
+          # Send command to bottom pane
+          tmux send-keys -t "${session_name}:0.1" C-c 2>/dev/null || true
+          sleep 0.3
+          if [[ -n "$device" ]]; then
+            tmux send-keys -t "${session_name}:0.1" "cd \"$wt_path\" && flutter run -d \"$device\"" Enter 2>/dev/null || true
+          else
+            tmux send-keys -t "${session_name}:0.1" "cd \"$wt_path\" && flutter run" Enter 2>/dev/null || true
+          fi
+        fi
+        ;;
+      TAB)
+        # Switch focus to Flutter pane
+        tmux select-pane -t "${session_name}:0.1" 2>/dev/null || true
+        ;;
+      QUIT)
+        tmux kill-session -t "$session_name" 2>/dev/null || true
+        exit 0
+        ;;
+    esac
+  done
+}
+
+start_tmux_mode() {
+  trap cleanup_tmux EXIT
+  
+  local script_path=$(realpath "$0")
+  
+  # Create tmux session
+  # Top pane (30%): Selector
+  # Bottom pane (70%): Flutter output
+  if [[ -n "$DEVICE" ]]; then
+    tmux new-session -d -s "$TMUX_SESSION" -x "$(tput cols)" -y "$(tput lines)" \
+      "\"$script_path\" --tmux-selector \"$TMUX_SESSION\" \"$DEVICE\""
+  else
+    tmux new-session -d -s "$TMUX_SESSION" -x "$(tput cols)" -y "$(tput lines)" \
+      "\"$script_path\" --tmux-selector \"$TMUX_SESSION\" \"\""
   fi
   
+  # Configure status bar style
+  tmux set-option -t "$TMUX_SESSION" status-style "bg=green,fg=black,bold"
+  tmux set-option -t "$TMUX_SESSION" status-left " 🦋 wtf | "
+  tmux set-option -t "$TMUX_SESSION" status-left-length 20
+  tmux set-option -t "$TMUX_SESSION" status-right " 📂 (none) "
+  tmux set-option -t "$TMUX_SESSION" status-right-length 50
+  
+  # Enable mouse support for pane selection
+  tmux set-option -t "$TMUX_SESSION" mouse on
+  
+  # Bind Tab key to switch between panes (works in both panes)
+  tmux bind-key -n Tab select-pane -t :.+
+  
+  # Set pane border with titles for better visibility
+  tmux set-option -t "$TMUX_SESSION" pane-border-style "fg=colour240"
+  tmux set-option -t "$TMUX_SESSION" pane-active-border-style "fg=colour46"
+  tmux set-option -t "$TMUX_SESSION" pane-border-status top
+  tmux set-option -t "$TMUX_SESSION" pane-border-format " #{?pane_active,#[fg=colour46]▶ ,  }#[fg=white,bold]#{pane_title}#[default] "
+  
+  # Split and create bottom pane for Flutter
+  tmux split-window -v -t "$TMUX_SESSION" -p 70 "bash"
+  
+  # Set pane titles
+  tmux select-pane -t "${TMUX_SESSION}:0.0" -T "📋 Worktree"
+  tmux select-pane -t "${TMUX_SESSION}:0.1" -T "🚀 Flutter"
+  
+  # Focus on top pane
+  tmux select-pane -t "${TMUX_SESSION}:0.0"
+  
+  # Attach
+  tmux attach-session -t "$TMUX_SESSION"
+}
+
+# Inline selector for split mode (runs in existing tmux)
+run_tmux_selector_inline() {
+  local device="$1"
+  local selected_idx=0
+  local current_wt=""
+  
+  # Use alternate screen buffer
+  printf '\033[?1049h'
+  trap 'printf "\033[?1049l\033[?25h"' EXIT
+  printf '\033[?25l'
+  
+  while true; do
+    load_worktrees
+    
+    if [[ ${#WT_NAMES[@]} -eq 0 ]]; then
+      echo -e "${RED}❌ No Flutter worktrees found${NC}"
+      sleep 2
+      continue
+    fi
+    
+    if [[ $selected_idx -ge ${#WT_NAMES[@]} ]]; then
+      selected_idx=$((${#WT_NAMES[@]} - 1))
+    fi
+    
+    printf '\033[H\033[J'
+    
+    # Header
+    echo -e "${MAGENTA}━━${NC} ${BOLD}🦋 wtf${NC} ${DIM}($PROJECT_NAME)${NC} ${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if [[ -n "$current_wt" ]]; then
+      echo -e "${GREEN}▶${NC} ${BOLD}$current_wt${NC} ${DIM}${device:+| 📱 $device}${NC}"
+    else
+      echo -e "${DIM}No active worktree${NC}"
+    fi
+    echo ""
+    
+    for i in "${!WT_NAMES[@]}"; do
+      local name="${WT_NAMES[$i]}"
+      local num=$((i + 1))
+      
+      if [[ $i -eq $selected_idx ]]; then
+        if [[ "$name" == "$current_wt" ]]; then
+          echo -e "  ${GREEN}${BOLD}▶ [$num] $name${NC} ${DIM}← running${NC}"
+        else
+          echo -e "  ${CYAN}${BOLD}▶ [$num] $name${NC}"
+        fi
+      else
+        if [[ "$name" == "$current_wt" ]]; then
+          echo -e "    ${GREEN}[$num] $name${NC} ${DIM}← running${NC}"
+        else
+          echo -e "    ${DIM}[$num]${NC} $name"
+        fi
+      fi
+    done
+    
+    echo ""
+    echo -e "${DIM}[↑↓] Move  [Enter] Switch  [Tab] Flutter pane  [q] Quit${NC}"
+    
+    local key_action=$(read_key)
+    
+    case "$key_action" in
+      UP)
+        if [[ $selected_idx -gt 0 ]]; then
+          ((selected_idx--))
+        else
+          selected_idx=$((${#WT_NAMES[@]} - 1))
+        fi
+        ;;
+      DOWN)
+        if [[ $selected_idx -lt $((${#WT_NAMES[@]} - 1)) ]]; then
+          ((selected_idx++))
+        else
+          selected_idx=0
+        fi
+        ;;
+      ENTER)
+        if [[ ${#WT_NAMES[@]} -gt 0 ]]; then
+          local wt_name="${WT_NAMES[$selected_idx]}"
+          local wt_path="${WT_PATHS[$selected_idx]}"
+          current_wt="$wt_name"
+          
+          # Send to next pane (below)
+          tmux send-keys -t :.+ C-c 2>/dev/null || true
+          sleep 0.3
+          if [[ -n "$device" ]]; then
+            tmux send-keys -t :.+ "cd \"$wt_path\" && flutter run -d \"$device\"" Enter 2>/dev/null || true
+          else
+            tmux send-keys -t :.+ "cd \"$wt_path\" && flutter run" Enter 2>/dev/null || true
+          fi
+        fi
+        ;;
+      NUM_*)
+        local num=${key_action#NUM_}
+        local idx=$((num - 1))
+        if [[ $idx -lt ${#WT_NAMES[@]} ]]; then
+          selected_idx=$idx
+          local wt_name="${WT_NAMES[$idx]}"
+          local wt_path="${WT_PATHS[$idx]}"
+          current_wt="$wt_name"
+          
+          tmux send-keys -t :.+ C-c 2>/dev/null || true
+          sleep 0.3
+          if [[ -n "$device" ]]; then
+            tmux send-keys -t :.+ "cd \"$wt_path\" && flutter run -d \"$device\"" Enter 2>/dev/null || true
+          else
+            tmux send-keys -t :.+ "cd \"$wt_path\" && flutter run" Enter 2>/dev/null || true
+          fi
+        fi
+        ;;
+      QUIT)
+        # Kill selector pane, keep flutter pane
+        exit 0
+        ;;
+    esac
+  done
+}
+
+# Split current tmux window (when already inside tmux)
+start_tmux_split_mode() {
+  local script_path=$(realpath "$0")
+  local current_pane=$(tmux display-message -p '#{pane_id}')
+  local current_window=$(tmux display-message -p '#{window_id}')
+  
+  # Store current pane to restore later
+  local original_pane="$current_pane"
+  
+  # Create top pane with selector (30%)
+  tmux split-window -v -b -p 30 -t "$current_pane" \
+    "\"$script_path\" --tmux-selector-inline \"$DEVICE\""
+  
+  local selector_pane=$(tmux display-message -p '#{pane_id}')
+  
+  # Set pane titles
+  tmux select-pane -t "$selector_pane" -T "📋 Worktree"
+  tmux select-pane -t "$original_pane" -T "🚀 Flutter"
+  
+  # Configure pane borders for current window
+  tmux set-option pane-border-style "fg=colour240"
+  tmux set-option pane-active-border-style "fg=colour46"
+  tmux set-option pane-border-status top
+  tmux set-option pane-border-format " #{?pane_active,#[fg=colour46]▶ ,  }#[fg=white,bold]#{pane_title}#[default] "
+  
+  # Bind Tab to switch panes (for current window only)
+  tmux bind-key -n Tab select-pane -t :.+
+  
+  # Focus on selector pane
+  tmux select-pane -t "$selector_pane"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLASSIC MODE (non-tmux fallback)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+run_classic_mode() {
   local current_idx=0
+  local selected_idx=0
   local initial_pwd="$PWD"
   
-  # Main selection loop
   while true; do
-    # Reload worktrees every iteration (auto-detect new worktrees)
     load_worktrees
     
     if [[ ${#WT_NAMES[@]} -eq 0 ]]; then
@@ -212,16 +601,18 @@ main() {
       exit 1
     fi
     
-    # Adjust current_idx if out of bounds (worktree was deleted)
     if [[ $current_idx -ge ${#WT_NAMES[@]} ]]; then
       current_idx=0
     fi
+    if [[ $selected_idx -ge ${#WT_NAMES[@]} ]]; then
+      selected_idx=0
+    fi
     
-    # Check if we're in a worktree (first iteration only)
     if [[ -n "$initial_pwd" ]]; then
       for i in "${!WT_PATHS[@]}"; do
         if [[ "$initial_pwd" == "${WT_PATHS[$i]}"* ]]; then
           current_idx=$i
+          selected_idx=$i
           break
         fi
       done
@@ -230,25 +621,39 @@ main() {
     
     clear
     print_banner "${WT_NAMES[$current_idx]}"
-    print_menu "${WT_NAMES[$current_idx]}"
+    print_menu "${WT_NAMES[$current_idx]}" "$selected_idx"
     
-    echo -ne "  ${BOLD}Select [1-${#WT_NAMES[@]}] or Enter to run current:${NC} "
-    read -rsn1 key
-    echo ""
+    local key_action=$(read_key)
     
-    case "$key" in
-      [1-9])
-        local idx=$((key - 1))
-        if [[ $idx -lt ${#WT_NAMES[@]} ]]; then
-          current_idx=$idx
-          run_flutter "${WT_NAMES[$idx]}" "${WT_PATHS[$idx]}"
+    case "$key_action" in
+      UP)
+        if [[ $selected_idx -gt 0 ]]; then
+          ((selected_idx--))
+        else
+          selected_idx=$((${#WT_NAMES[@]} - 1))
         fi
         ;;
-      ""|$'\n')
-        # Enter pressed - run current
-        run_flutter "${WT_NAMES[$current_idx]}" "${WT_PATHS[$current_idx]}"
+      DOWN)
+        if [[ $selected_idx -lt $((${#WT_NAMES[@]} - 1)) ]]; then
+          ((selected_idx++))
+        else
+          selected_idx=0
+        fi
         ;;
-      q|Q)
+      ENTER)
+        current_idx=$selected_idx
+        run_flutter_classic "${WT_NAMES[$selected_idx]}" "${WT_PATHS[$selected_idx]}"
+        ;;
+      NUM_*)
+        local num=${key_action#NUM_}
+        local idx=$((num - 1))
+        if [[ $idx -lt ${#WT_NAMES[@]} ]]; then
+          selected_idx=$idx
+          current_idx=$idx
+          run_flutter_classic "${WT_NAMES[$idx]}" "${WT_PATHS[$idx]}"
+        fi
+        ;;
+      QUIT)
         echo -e "\n${YELLOW}👋 Goodbye!${NC}"
         exit 0
         ;;
@@ -256,4 +661,55 @@ main() {
   done
 }
 
-main
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+main() {
+  # Handle internal modes
+  case "${1:-}" in
+    --tmux-selector)
+      shift
+      run_tmux_selector "$@"
+      exit 0
+      ;;
+    --tmux-selector-inline)
+      shift
+      run_tmux_selector_inline "$@"
+      exit 0
+      ;;
+  esac
+  
+  # Auto-detect device
+  if [[ -z "$DEVICE" ]]; then
+    echo -e "${YELLOW}🔍 Detecting devices...${NC}"
+    DEVICE=$(flutter devices 2>/dev/null | grep -E "•|•" | head -1 | awk -F'•' '{print $2}' | xargs)
+    if [[ -z "$DEVICE" ]]; then
+      echo -e "${YELLOW}⚠️  No device specified, Flutter will auto-select${NC}"
+    else
+      echo -e "${GREEN}📱 Using device: $DEVICE${NC}"
+    fi
+  fi
+  
+  # Check for tmux
+  if command -v tmux &>/dev/null; then
+    if [[ -n "$TMUX" ]]; then
+      echo -e "${GREEN}✓ Already in tmux - splitting current window${NC}"
+      echo -e "${DIM}  Top: Worktree selection | Bottom: Flutter${NC}"
+      sleep 1
+      start_tmux_split_mode
+    else
+      echo -e "${GREEN}✓ tmux detected - using split view mode${NC}"
+      echo -e "${DIM}  Top: Worktree selection | Bottom: Flutter${NC}"
+      sleep 1
+      start_tmux_mode
+    fi
+  else
+    echo -e "${YELLOW}⚠️  tmux not found - using classic mode${NC}"
+    echo -e "${DIM}  Install tmux for split view: brew install tmux${NC}"
+    sleep 1
+    run_classic_mode
+  fi
+}
+
+main "$@"

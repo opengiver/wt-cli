@@ -44,8 +44,9 @@ chmod +x ~/.local/bin/wt ~/.local/bin/wtf
 ### `wt` - Worktree Management
 
 ```bash
+wt                 # Interactive mode: tmux UI with worktree selector + dev server
 wt ls              # List all worktrees and their status
-wt cd <name>       # Print path to worktree (use: cd $(wt cd <name>))
+wt cd <name>       # Change to worktree directory
 wt ports           # Show port assignments
 wt open <name>     # Open worktree in browser
 wt dev-all         # Start all dev servers in tmux
@@ -53,8 +54,16 @@ wt attach          # Attach to tmux session
 wt stop [name]     # Stop dev server(s)
 wt link-env [name] # Link .env files from main repo to worktree
 wt link-env-all    # Link .env files to all worktrees
+wt install [name]  # Install dependencies in worktree
+wt install-all     # Install dependencies in all worktrees
+wt setup           # Install shell integration (for wt cd)
 wt help            # Show help
 ```
+
+**Interactive Mode** (`wt` with no args):
+- Top pane: Worktree selector with port status
+- Bottom pane: Dev server output
+- `↑/↓` to navigate, `Enter` to start, `Tab` to switch panes, `q` to quit
 
 ### `wtf` - Worktree Flutter Switcher
 
@@ -65,10 +74,23 @@ wtf                # Start interactive mode
 wtf "iPhone 15"    # Start with specific device
 ```
 
-**Inside wtf:**
-- Press `1-9` to switch worktree
-- Press `q` to quit flutter and return to selection
-- Standard flutter keys: `r` (hot reload), `R` (hot restart)
+**Two modes:**
+
+1. **tmux mode** (when tmux is installed):
+   - Split view: top pane shows worktree list, bottom pane runs Flutter
+   - Switch worktrees while Flutter is running (no need to quit!)
+   - Worktree list auto-updates
+
+2. **Classic mode** (fallback when no tmux):
+   - Traditional menu-based selection
+   - Press `q` in Flutter to return to selection
+
+**Controls:**
+- `↑`/`↓` - Navigate worktree list
+- `Enter` - Select and run Flutter
+- `1-9` - Jump directly to worktree
+- `q` - Quit
+- In Flutter: `r` (hot reload), `R` (hot restart), `q` (quit flutter)
 
 ## Example Workflow
 
@@ -80,18 +102,21 @@ git worktree add -b feature/ui ../my-app-worktrees/feature-ui main
 # 2. Link .env files (required for builds)
 wt link-env-all
 
-# 3. Check status
+# 3. Install dependencies in all worktrees
+wt install-all
+
+# 4. Check status
 wt ls
 
-# 4. Start all dev servers
+# 5. Start all dev servers
 wt dev-all
 
-# 4. Switch between worktrees in tmux
+# 6. Switch between worktrees in tmux
 wt attach
 # Ctrl+b, n  → next worktree
 # Ctrl+b, p  → previous worktree
 
-# 5. For Flutter projects
+# 7. For Flutter projects
 wtf
 # Select worktree by number, flutter run starts automatically
 ```
@@ -109,7 +134,7 @@ wtf
 
 - Git
 - Bash
-- tmux (optional, for `wt dev-all`)
+- tmux (optional, for `wt dev-all` and `wtf` split view)
 - Flutter (for `wtf`)
 
 ## License

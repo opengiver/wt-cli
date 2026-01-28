@@ -1,13 +1,13 @@
 {
   "name": "@opengiver/wt-cli",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Git worktree management CLI for parallel development",
   "bin": {
     "wt": "./bin/wt",
     "wtf": "./bin/wtf"
   },
   "scripts": {
-    "postinstall": "chmod +x ./bin/wt ./bin/wtf 2>/dev/null || true"
+    "postinstall": "chmod +x ./bin/wt ./bin/wtf 2>/dev/null || true; ./bin/wt setup 2>/dev/null || true"
   },
   "keywords": [
     "git",

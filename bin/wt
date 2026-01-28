@@ -11,6 +11,10 @@
 #   attach            Attach to tmux session
 #   ports             Show port assignments
 #   open [name]       Open in browser (localhost:PORT)
+#   link-env [name]   Link .env files from main repo to worktree
+#   link-env-all      Link .env files to all worktrees
+#   install [name]    Install dependencies in worktree
+#   install-all       Install dependencies in all worktrees
 
 set -e
 
@@ -20,33 +24,60 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+INTERACTIVE_SESSION="wt-interactive-$$"
 
 # Find project root (main repo, not worktree)
 find_project_root() {
-  # First find git root (could be worktree or main repo)
   local git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+  
   if [[ -z "$git_root" ]]; then
-    echo ""
-    return
+    # Not in a git repo - check subdirectories for git repos
+    local found_repos=()
+    for dir in */; do
+      if [[ -d "$dir/.git" ]] || [[ -f "$dir/.git" ]]; then
+        found_repos+=("${dir%/}")
+      fi
+    done
+    
+    if [[ ${#found_repos[@]} -eq 1 ]]; then
+      # Single repo found - use it
+      git_root="$PWD/${found_repos[0]}"
+    elif [[ ${#found_repos[@]} -gt 1 ]]; then
+      # Multiple repos - check for worktrees dir pattern
+      for repo in "${found_repos[@]}"; do
+        if [[ -d "$PWD/${repo}-worktrees" ]]; then
+          git_root="$PWD/$repo"
+          break
+        fi
+      done
+      # If still not found, use first one
+      if [[ -z "$git_root" ]]; then
+        git_root="$PWD/${found_repos[0]}"
+      fi
+    else
+      echo ""
+      return
+    fi
   fi
   
   # Check if this is a worktree (has .git file instead of .git directory)
   if [[ -f "$git_root/.git" ]]; then
-    # It's a worktree - extract main repo path from .git file
-    # .git file contains: gitdir: /path/to/main-repo/.git/worktrees/worktree-name
     local gitdir=$(cat "$git_root/.git" | sed 's/gitdir: //')
-    # Extract main repo path
     echo "$gitdir" | sed 's/\/\.git\/worktrees\/.*//'
   else
-    # It's the main repo
     echo "$git_root"
   fi
 }
 
 PROJECT_ROOT=$(find_project_root)
 if [[ -z "$PROJECT_ROOT" ]]; then
-  echo -e "${RED}Error: Not in a git repository${NC}"
+  echo -e "${RED}Error: No git repository found${NC}"
+  echo -e "${DIM}Run from inside a git repo or a parent directory containing repos${NC}"
   exit 1
 fi
 
@@ -511,16 +542,429 @@ cmd_link_env_all() {
   done
 }
 
+# Get install command for project type
+get_install_command() {
+  local dir="${1:-$PWD}"
+  local project_type=$(detect_project_type "$dir")
+  
+  case $project_type in
+    flutter)
+      local flutter_dir=$(find_flutter_dir "$dir")
+      if [[ "$flutter_dir" != "$dir" ]] && [[ -n "$flutter_dir" ]]; then
+        echo "cd '$flutter_dir' && flutter pub get"
+      else
+        echo "flutter pub get"
+      fi
+      ;;
+    nodejs)
+      # Find package.json location
+      local pkg_dir="$dir"
+      local check_dirs=("$dir" "$dir/app" "$dir/src" "$dir/client" "$dir/frontend")
+      for check_dir in "${check_dirs[@]}"; do
+        if [[ -f "$check_dir/package.json" ]]; then
+          pkg_dir="$check_dir"
+          break
+        fi
+      done
+      
+      if [[ -f "$pkg_dir/package.json" ]]; then
+        local cd_prefix=""
+        if [[ "$pkg_dir" != "$dir" ]]; then
+          cd_prefix="cd '$pkg_dir' && "
+        fi
+        
+        # Detect package manager
+        if [[ -f "$pkg_dir/pnpm-lock.yaml" ]]; then
+          echo "${cd_prefix}pnpm install"
+        elif [[ -f "$pkg_dir/yarn.lock" ]]; then
+          echo "${cd_prefix}yarn install"
+        elif [[ -f "$pkg_dir/bun.lockb" ]]; then
+          echo "${cd_prefix}bun install"
+        else
+          echo "${cd_prefix}npm install"
+        fi
+      fi
+      ;;
+    go)
+      echo "go mod download"
+      ;;
+    rust)
+      echo "cargo fetch"
+      ;;
+    python)
+      if [[ -f "$dir/pyproject.toml" ]]; then
+        echo "pip install -e ."
+      elif [[ -f "$dir/requirements.txt" ]]; then
+        echo "pip install -r requirements.txt"
+      else
+        echo "echo 'No requirements found'"
+      fi
+      ;;
+    *)
+      echo "echo 'Unknown project type - cannot install'"
+      ;;
+  esac
+}
+
+# Install dependencies in a worktree
+cmd_install() {
+  local target_wt="$1"
+  local target_dir
+  
+  if [[ -z "$target_wt" ]]; then
+    # Use current directory
+    target_dir=$(git rev-parse --show-toplevel 2>/dev/null)
+  else
+    target_dir="$WORKTREES_DIR/$target_wt"
+  fi
+  
+  if [[ ! -d "$target_dir" ]]; then
+    echo -e "${RED}Worktree not found: $target_dir${NC}"
+    exit 1
+  fi
+  
+  local project_type=$(detect_project_type "$target_dir")
+  local install_cmd=$(get_install_command "$target_dir")
+  
+  echo -e "${CYAN}📦 Installing dependencies...${NC}"
+  echo -e "   Path: ${BLUE}$target_dir${NC}"
+  echo -e "   Type: $project_type"
+  echo -e "   Command: $install_cmd"
+  echo ""
+  
+  # Run install command
+  (cd "$target_dir" && eval "$install_cmd")
+  
+  if [[ $? -eq 0 ]]; then
+    echo ""
+    echo -e "${GREEN}✅ Dependencies installed successfully${NC}"
+  else
+    echo ""
+    echo -e "${RED}❌ Installation failed${NC}"
+    return 1
+  fi
+}
+
+# Install dependencies in all worktrees
+cmd_install_all() {
+  echo -e "${CYAN}📦 Installing dependencies in all worktrees...${NC}"
+  echo ""
+  
+  if [[ ! -d "$WORKTREES_DIR" ]]; then
+    echo -e "${YELLOW}No worktrees found${NC}"
+    return
+  fi
+  
+  local success=0
+  local failed=0
+  
+  for wt in "$WORKTREES_DIR"/*/; do
+    if [[ -d "$wt" ]]; then
+      local name=$(basename "$wt")
+      echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+      echo -e "${BLUE}[$name]${NC}"
+      echo ""
+      
+      if cmd_install "$name"; then
+        ((success++))
+      else
+        ((failed++))
+      fi
+      echo ""
+    fi
+  done
+  
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  echo -e "${CYAN}Summary:${NC}"
+  echo -e "  ${GREEN}✅ Success: $success${NC}"
+  if [[ $failed -gt 0 ]]; then
+    echo -e "  ${RED}❌ Failed: $failed${NC}"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTERACTIVE MODE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+declare -a WT_NAMES
+declare -a WT_PATHS
+declare -a WT_PORTS
+
+load_worktrees_interactive() {
+  WT_NAMES=()
+  WT_PATHS=()
+  WT_PORTS=()
+  
+  if [[ -d "$WORKTREES_DIR" ]]; then
+    local index=0
+    for wt in "$WORKTREES_DIR"/*/; do
+      if [[ -d "$wt" ]]; then
+        local name=$(basename "$wt")
+        local port=$((BASE_PORT + index))
+        WT_NAMES+=("$name")
+        WT_PATHS+=("${wt%/}")
+        WT_PORTS+=("$port")
+        ((index++))
+      fi
+    done
+  fi
+}
+
+read_key() {
+  local key
+  if ! IFS= read -rsn1 -t 1 key 2>/dev/null; then
+    echo "TIMEOUT"
+    return
+  fi
+  
+  if [[ "$key" == $'\033' ]]; then
+    read -rsn2 -t 0.1 key 2>/dev/null || true
+    case "$key" in
+      '[A') echo "UP" ;;
+      '[B') echo "DOWN" ;;
+      *) echo "ESC" ;;
+    esac
+  elif [[ "$key" == "" ]]; then
+    echo "ENTER"
+  elif [[ "$key" == $'\t' ]]; then
+    echo "TAB"
+  elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+    echo "QUIT"
+  elif [[ "$key" =~ ^[1-9]$ ]]; then
+    echo "NUM_$key"
+  else
+    echo "OTHER"
+  fi
+}
+
+run_interactive_selector() {
+  local session_name="$1"
+  local selected_idx=0
+  local current_wt=""
+  
+  printf '\033[?1049h'
+  trap 'printf "\033[?1049l\033[?25h"' EXIT
+  printf '\033[?25l'
+  
+  while true; do
+    load_worktrees_interactive
+    
+    if [[ ${#WT_NAMES[@]} -eq 0 ]]; then
+      printf '\033[H\033[J'
+      echo -e "${RED}❌ No worktrees found${NC}"
+      echo -e "${DIM}Create with: git worktree add ../${PROJECT_NAME}-worktrees/<name> <branch>${NC}"
+      sleep 2
+      continue
+    fi
+    
+    if [[ $selected_idx -ge ${#WT_NAMES[@]} ]]; then
+      selected_idx=$((${#WT_NAMES[@]} - 1))
+    fi
+    
+    printf '\033[H\033[J'
+    
+    echo -e "${MAGENTA}━━${NC} ${BOLD}🌳 wt${NC} ${DIM}($PROJECT_NAME)${NC} ${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if [[ -n "$current_wt" ]]; then
+      local current_port=""
+      for i in "${!WT_NAMES[@]}"; do
+        if [[ "${WT_NAMES[$i]}" == "$current_wt" ]]; then
+          current_port="${WT_PORTS[$i]}"
+          break
+        fi
+      done
+      echo -e "${GREEN}▶${NC} ${BOLD}$current_wt${NC} ${DIM}| localhost:$current_port${NC}"
+    else
+      echo -e "${DIM}Select a worktree to start dev server${NC}"
+    fi
+    echo ""
+    
+    for i in "${!WT_NAMES[@]}"; do
+      local name="${WT_NAMES[$i]}"
+      local port="${WT_PORTS[$i]}"
+      local num=$((i + 1))
+      local port_status=""
+      
+      if is_port_in_use "$port"; then
+        port_status="${GREEN}●${NC} :$port"
+      else
+        port_status="${DIM}○ :$port${NC}"
+      fi
+      
+      if [[ $i -eq $selected_idx ]]; then
+        if [[ "$name" == "$current_wt" ]]; then
+          echo -e "  ${GREEN}${BOLD}▶ [$num] $name${NC} $port_status ${DIM}← active${NC}"
+        else
+          echo -e "  ${CYAN}${BOLD}▶ [$num] $name${NC} $port_status"
+        fi
+      else
+        if [[ "$name" == "$current_wt" ]]; then
+          echo -e "    ${GREEN}[$num] $name${NC} $port_status ${DIM}← active${NC}"
+        else
+          echo -e "    ${DIM}[$num]${NC} $name $port_status"
+        fi
+      fi
+    done
+    
+    echo ""
+    echo -e "${DIM}[↑↓] Move  [Enter] Start  [Tab] Server pane  [q] Quit${NC}"
+    
+    local key_action=$(read_key)
+    
+    case "$key_action" in
+      UP)
+        if [[ $selected_idx -gt 0 ]]; then
+          ((selected_idx--))
+        else
+          selected_idx=$((${#WT_NAMES[@]} - 1))
+        fi
+        ;;
+      DOWN)
+        if [[ $selected_idx -lt $((${#WT_NAMES[@]} - 1)) ]]; then
+          ((selected_idx++))
+        else
+          selected_idx=0
+        fi
+        ;;
+      ENTER|NUM_*)
+        local idx=$selected_idx
+        if [[ "$key_action" == NUM_* ]]; then
+          local num=${key_action#NUM_}
+          idx=$((num - 1))
+          if [[ $idx -ge ${#WT_NAMES[@]} ]]; then
+            continue
+          fi
+          selected_idx=$idx
+        fi
+        
+        local wt_name="${WT_NAMES[$idx]}"
+        local wt_path="${WT_PATHS[$idx]}"
+        local wt_port="${WT_PORTS[$idx]}"
+        current_wt="$wt_name"
+        
+        local dev_cmd=$(get_dev_command "$wt_path" "$wt_port")
+        
+        tmux send-keys -t "${session_name}:0.1" C-c 2>/dev/null || true
+        sleep 0.3
+        tmux send-keys -t "${session_name}:0.1" "cd \"$wt_path\" && $dev_cmd" Enter 2>/dev/null || true
+        ;;
+      TAB)
+        tmux select-pane -t "${session_name}:0.1" 2>/dev/null || true
+        ;;
+      QUIT)
+        tmux kill-session -t "$session_name" 2>/dev/null || true
+        exit 0
+        ;;
+    esac
+  done
+}
+
+cleanup_interactive() {
+  tmux kill-session -t "$INTERACTIVE_SESSION" 2>/dev/null || true
+}
+
+cmd_interactive() {
+  if ! command -v tmux &>/dev/null; then
+    echo -e "${RED}tmux required for interactive mode${NC}"
+    echo -e "${DIM}Install: brew install tmux${NC}"
+    exit 1
+  fi
+  
+  trap cleanup_interactive EXIT
+  
+  local script_path=$(realpath "$0")
+  
+  tmux new-session -d -s "$INTERACTIVE_SESSION" -x "$(tput cols)" -y "$(tput lines)" \
+    "\"$script_path\" --interactive-selector \"$INTERACTIVE_SESSION\""
+  
+  tmux set-option -t "$INTERACTIVE_SESSION" status-style "bg=cyan,fg=black,bold"
+  tmux set-option -t "$INTERACTIVE_SESSION" status-left " 🌳 wt | "
+  tmux set-option -t "$INTERACTIVE_SESSION" status-left-length 20
+  tmux set-option -t "$INTERACTIVE_SESSION" status-right " $PROJECT_NAME "
+  tmux set-option -t "$INTERACTIVE_SESSION" mouse on
+  tmux bind-key -n Tab select-pane -t :.+
+  
+  tmux set-option -t "$INTERACTIVE_SESSION" pane-border-style "fg=colour240"
+  tmux set-option -t "$INTERACTIVE_SESSION" pane-active-border-style "fg=colour51"
+  tmux set-option -t "$INTERACTIVE_SESSION" pane-border-status top
+  tmux set-option -t "$INTERACTIVE_SESSION" pane-border-format " #{?pane_active,#[fg=colour51]▶ ,  }#[fg=white,bold]#{pane_title}#[default] "
+  
+  tmux split-window -v -t "$INTERACTIVE_SESSION" -p 70 "bash"
+  
+  tmux select-pane -t "${INTERACTIVE_SESSION}:0.0" -T "📋 Worktrees"
+  tmux select-pane -t "${INTERACTIVE_SESSION}:0.1" -T "🚀 Dev Server"
+  
+  tmux select-pane -t "${INTERACTIVE_SESSION}:0.0"
+  
+  tmux attach-session -t "$INTERACTIVE_SESSION"
+}
+
+SHELL_INTEGRATION='
+# wt-cli (DO NOT EDIT)
+wt() {
+  if [[ "$1" == "cd" ]] && [[ -n "$2" ]]; then
+    local target_dir
+    target_dir=$(command wt cd "$2" 2>/dev/null)
+    if [[ -n "$target_dir" ]] && [[ -d "$target_dir" ]]; then
+      cd "$target_dir"
+    else
+      command wt cd "$2"
+    fi
+  else
+    command wt "$@"
+  fi
+}
+# wt-cli end'
+
+cmd_setup() {
+  local rc_file=""
+  
+  if [[ -n "$ZSH_VERSION" ]] || [[ "$SHELL" == *"zsh"* ]]; then
+    rc_file="$HOME/.zshrc"
+  elif [[ -n "$BASH_VERSION" ]] || [[ "$SHELL" == *"bash"* ]]; then
+    rc_file="$HOME/.bashrc"
+  elif [[ -f "$HOME/.zshrc" ]]; then
+    rc_file="$HOME/.zshrc"
+  elif [[ -f "$HOME/.bashrc" ]]; then
+    rc_file="$HOME/.bashrc"
+  fi
+  
+  if [[ -z "$rc_file" ]]; then
+    echo -e "${YELLOW}Could not detect shell config file${NC}"
+    echo "Run manually: wt shell-init >> ~/.zshrc"
+    return 1
+  fi
+  
+  if [[ -f "$rc_file" ]] && grep -q "wt-cli (DO NOT EDIT)" "$rc_file" 2>/dev/null; then
+    echo -e "${GREEN}✅ Shell integration already installed${NC}"
+    return 0
+  fi
+  
+  echo "$SHELL_INTEGRATION" >> "$rc_file"
+  echo -e "${GREEN}✅ Shell integration added to $rc_file${NC}"
+  echo -e "   Run: ${CYAN}source $rc_file${NC} or restart terminal"
+}
+
+cmd_shell_init() {
+  echo "$SHELL_INTEGRATION"
+  echo ""
+  echo "# To install automatically, run: wt setup"
+}
+
 # Show help
 cmd_help() {
   echo -e "${CYAN}wt - Worktree Management CLI${NC}"
   echo ""
-  echo "Usage: wt <command> [args]"
+  echo "Usage: wt [command] [args]"
+  echo ""
+  echo "Interactive Mode (no args):"
+  echo "  wt                Start interactive tmux UI"
+  echo "                    ↑/↓ to select, Enter to start dev server"
   echo ""
   echo "Commands:"
   echo "  ls, list          List all worktrees and their status"
-  echo "  cd <name>         Print path to worktree"
-  echo "                    Usage: cd \$(wt cd <name>)"
+  echo "  cd <name>         Change to worktree directory"
+  echo "                    (requires shell-init, or use: cd \$(wt cd <name>))"
   echo "  dev [name]        Start dev server in tmux"
   echo "  dev-all           Start all worktrees in tmux session"
   echo "  stop [name|all]   Stop dev server(s)"
@@ -529,6 +973,10 @@ cmd_help() {
   echo "  open [name]       Open in browser"
   echo "  link-env [name]   Link .env files from main repo to worktree"
   echo "  link-env-all      Link .env files to all worktrees"
+  echo "  install [name]    Install dependencies in worktree"
+  echo "  install-all       Install dependencies in all worktrees"
+  echo "  setup             Install shell integration (run once after install)"
+  echo "  shell-init        Output shell integration script"
   echo ""
   echo "tmux Shortcuts (after 'wt attach'):"
   echo "  Ctrl+b, n         Next window (next worktree)"
@@ -547,7 +995,15 @@ cmd_help() {
 }
 
 # Main command router
-case "${1:-help}" in
+case "${1:-}" in
+  --interactive-selector)
+    shift
+    run_interactive_selector "$@"
+    exit 0
+    ;;
+  "")
+    cmd_interactive
+    ;;
   ls|list)
     cmd_list
     ;;
@@ -577,6 +1033,18 @@ case "${1:-help}" in
     ;;
   link-env-all)
     cmd_link_env_all
+    ;;
+  install)
+    cmd_install "$2"
+    ;;
+  install-all)
+    cmd_install_all
+    ;;
+  setup)
+    cmd_setup
+    ;;
+  shell-init)
+    cmd_shell_init
     ;;
   help|--help|-h)
     cmd_help
